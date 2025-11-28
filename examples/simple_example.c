@@ -2,23 +2,23 @@
 #include <unistd.h>  /* for sleep */
 
 int main(void) {
-    /* 示例1: 默认配置初始化 */
-    printf("=== 示例1: 默认配置 ===\n");
+    /* Example 1: Default configuration initialization */
+    printf("=== Example 1: Default Configuration ===\n");
     if (log_init(NULL) != 0) {
-        fprintf(stderr, "日志初始化失败\n");
+        fprintf(stderr, "Log initialization failed\n");
         return 1;
     }
 
-    LOG_INFO("应用程序启动");
-    LOG_DEBUG("调试信息: value = %d", 42);
-    LOG_WARN("警告信息");
-    LOG_ERROR("错误信息: %s", "something went wrong");
-    LOG_INFO("应用程序运行中...");
+    LOG_INFO("Application started");
+    LOG_DEBUG("Debug info: value = %d", 42);
+    LOG_WARN("Warning message");
+    LOG_ERROR("Error message: %s", "something went wrong");
+    LOG_INFO("Application running...");
 
     log_cleanup();
 
-    /* 示例2: 自定义配置 */
-    printf("\n=== 示例2: 自定义配置 ===\n");
+    /* Example 2: Custom configuration */
+    printf("\n=== Example 2: Custom Configuration ===\n");
     log_config_t config = {
         .level = LOG_LEVEL_DEBUG,
         .outputs = LOG_OUTPUT_CONSOLE | LOG_OUTPUT_FILE,
@@ -28,27 +28,27 @@ int main(void) {
     };
 
     if (log_init(&config) != 0) {
-        fprintf(stderr, "日志初始化失败\n");
+        fprintf(stderr, "Log initialization failed\n");
         return 1;
     }
 
-    LOG_INFO("使用自定义配置启动");
-    LOG_DEBUG("调试模式已启用");
-    LOG_WARN("这是一个警告");
-    LOG_ERROR("这是一个错误");
+    LOG_INFO("Started with custom configuration");
+    LOG_DEBUG("Debug mode enabled");
+    LOG_WARN("This is a warning");
+    LOG_ERROR("This is an error");
 
-    /* 动态改变配置 */
-    printf("\n=== 示例3: 动态配置 ===\n");
+    /* Dynamic configuration changes */
+    printf("\n=== Example 3: Dynamic Configuration ===\n");
     log_set_level(LOG_LEVEL_ERROR);
-    LOG_DEBUG("这个调试信息不会显示");  /* 低于当前级别 */
-    LOG_INFO("这个信息也不会显示");    /* 低于当前级别 */
-    LOG_ERROR("只有错误级别会显示");
+    LOG_DEBUG("This debug message will not be shown");  /* Below current level */
+    LOG_INFO("This info message will not be shown");    /* Below current level */
+    LOG_ERROR("Only error level will be shown");
 
     log_enable_colors(false);
-    LOG_ERROR("颜色已禁用");
+    LOG_ERROR("Colors disabled");
 
     log_cleanup();
 
-    printf("\n日志示例完成，请查看 app.log 文件\n");
+    printf("\nLog example completed, please check app.log file\n");
     return 0;
 }
