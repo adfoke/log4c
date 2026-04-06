@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 project(log4c VERSION 0.1.0 LANGUAGES C)
 
+include(CMakePackageConfigHelpers)
 include(GNUInstallDirs)
 include(CTest)
 find_package(Threads)
@@ -89,5 +90,24 @@ install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 install(EXPORT log4cTargets
     NAMESPACE log4c::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/log4c
+)
+
+configure_package_config_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/log4cConfig.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/log4cConfig.cmake
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/log4c
+)
+
+write_basic_package_version_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/log4cConfigVersion.cmake
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion
+)
+
+install(
+    FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/log4cConfig.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/log4cConfigVersion.cmake
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/log4c
 )

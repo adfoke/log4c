@@ -30,6 +30,27 @@ ctest --test-dir build --output-on-failure
 
 ## 集成
 
+推荐先安装，再用 `find_package`。
+
+安装：
+
+```sh
+cmake -S . -B build
+cmake --build build
+cmake --install build --prefix /your/install/prefix
+```
+
+外部项目：
+
+```cmake
+find_package(log4c CONFIG REQUIRED)
+
+add_executable(my_app main.c)
+target_link_libraries(my_app PRIVATE log4c::log4c)
+```
+
+如果是同仓库，也可以继续用 `add_subdirectory`：
+
 ```cmake
 add_subdirectory(path/to/log4c)
 
