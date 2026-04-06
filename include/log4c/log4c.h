@@ -145,6 +145,31 @@ typedef struct log4c_threadsafe_logger {
     pthread_mutex_t mutex;
 } log4c_threadsafe_logger;
 
+typedef enum log4c_async_queue_policy {
+    LOG4C_ASYNC_QUEUE_BLOCK = 0,
+    LOG4C_ASYNC_QUEUE_DROP_NEWEST = 1,
+    LOG4C_ASYNC_QUEUE_DROP_OLDEST = 2
+} log4c_async_queue_policy;
+
+typedef enum log4c_async_error {
+    LOG4C_ASYNC_ERROR_ALLOC = 0,
+    LOG4C_ASYNC_ERROR_QUEUE_FULL = 1,
+    LOG4C_ASYNC_ERROR_SINK_WRITE = 2
+} log4c_async_error;
+
+typedef void (*log4c_async_error_fn)(void *userdata, log4c_async_error error, const char *detail);
+
+typedef struct log4c_async_stats {
+    size_t current_queue;
+    size_t max_queue;
+    size_t enqueued;
+    size_t written;
+    size_t dropped;
+    size_t queue_full;
+    size_t alloc_failures;
+    size_t write_failures;
+} log4c_async_stats;
+
 typedef struct log4c_async_logger {
     log4c_logger logger;
     pthread_t thread;
@@ -159,6 +184,10 @@ typedef struct log4c_async_logger {
     bool stop;
     bool worker_active;
     bool worker_failed;
+    log4c_async_queue_policy queue_policy;
+    log4c_async_error_fn error_callback;
+    void *error_userdata;
+    log4c_async_stats stats;
 } log4c_async_logger;
 
 bool log4c_threadsafe_logger_init(log4c_threadsafe_logger *wrapper, FILE *stream);
@@ -171,6 +200,19 @@ bool log4c_async_logger_init_from_config(
     log4c_async_logger *wrapper,
     const log4c_config *config,
     size_t max_queue
+);
+void log4c_async_logger_set_queue_policy(
+    log4c_async_logger *wrapper,
+    log4c_async_queue_policy policy
+);
+void log4c_async_logger_set_error_callback(
+    log4c_async_logger *wrapper,
+    log4c_async_error_fn callback,
+    void *userdata
+);
+bool log4c_async_logger_get_stats(
+    log4c_async_logger *wrapper,
+    log4c_async_stats *stats
 );
 bool log4c_async_logger_flush(log4c_async_logger *wrapper);
 void log4c_async_logger_destroy(log4c_async_logger *wrapper);

@@ -1,6 +1,6 @@
 # log4c
 
-一个 C17 日志库。
+轻量 C17 日志库。
 
 支持：
 
@@ -12,6 +12,13 @@
 - 自动建目录
 - `key=value` 配置文件
 - `CMake`
+
+## 平台
+
+- 支持 `Linux`
+- 支持 `macOS`
+- 不支持 `Windows`
+- 异步日志依赖 `pthread`
 
 ## 构建
 
@@ -46,45 +53,11 @@ int main(void) {
 
     log4c_logger_init(&logger, stderr);
     log4c_logger_set_level(&logger, LOG4C_LEVEL_INFO);
-
     LOG4C_INFO(&logger, "app", "started");
-
     log4c_logger_destroy(&logger);
     return 0;
 }
 ```
-
-## 文件日志
-
-```c
-log4c_logger logger;
-
-log4c_logger_init(&logger, stderr);
-log4c_logger_clear_sinks(&logger);
-log4c_logger_add_file_sink(&logger, "logs/app.log", LOG4C_OPTION_AUTO_FLUSH);
-
-LOG4C_INFO(&logger, "app", "written to file");
-log4c_logger_destroy(&logger);
-```
-
-## 滚动日志
-
-```c
-log4c_logger logger;
-
-log4c_logger_init(&logger, stderr);
-log4c_logger_clear_sinks(&logger);
-log4c_logger_add_rotating_file_sink(&logger, "logs/app.log", 1048576U, 3U, LOG4C_OPTION_AUTO_FLUSH);
-
-LOG4C_INFO(&logger, "app", "rotate by size");
-log4c_logger_destroy(&logger);
-```
-
-规则：
-
-- 当前文件超 `max_bytes` 前先滚动
-- 备份文件是 `app.log.1`、`app.log.2`
-- 最多保留 `max_files` 个备份
 
 ## 配置文件
 
@@ -102,8 +75,6 @@ location=true
 auto_flush=true
 console_stream=stderr
 ```
-
-使用：
 
 ```c
 log4c_config config;
@@ -124,37 +95,35 @@ log4c_logger_destroy(&logger);
 
 ## 异步日志
 
-需要 `pthread`。
-
 ```c
 log4c_async_logger logger;
+log4c_async_stats stats;
 
 if (!log4c_async_logger_init(&logger, stderr, 1024U)) {
     return 1;
 }
 
-log4c_logger_set_level(&logger.logger, LOG4C_LEVEL_DEBUG);
+log4c_async_logger_set_queue_policy(&logger, LOG4C_ASYNC_QUEUE_DROP_NEWEST);
 LOG4C_ASYNC_INFO(&logger, "app", "queued");
-LOG4C_ASYNC_WARN(&logger, "app", "written by background thread");
-
 log4c_async_logger_flush(&logger);
+log4c_async_logger_get_stats(&logger, &stats);
 log4c_async_logger_destroy(&logger);
 ```
 
-说明：
+异步模式补充：
 
-- 调用线程只负责入队
-- 后台线程负责写 sink
-- `flush` 等待队列清空
-- `destroy` 会 drain 剩余消息
+- 调用线程只入队
+- 后台线程写 sink
+- 满队策略：`BLOCK`、`DROP_NEWEST`、`DROP_OLDEST`
+- 支持错误回调和统计
 
 ## 目录
 
-- `include/log4c/log4c.h` 公开接口
-- `src/log4c.c` 实现
-- `examples/basic.c` 同步示例
-- `examples/from_config.c` 配置示例
-- `examples/async.c` 异步示例
-- `examples/log4c.conf` 配置示例
-- `templates/minimal_app` 最小接入模板
-- `tests/test_log4c.c` 测试
+- `include/log4c/log4c.h`
+- `src/log4c.c`
+- `examples/basic.c`
+- `examples/from_config.c`
+- `examples/async.c`
+- `examples/log4c.conf`
+- `templates/minimal_app`
+- `tests/test_log4c.c`

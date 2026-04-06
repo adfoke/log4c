@@ -1398,6 +1398,25 @@ static log4c_async_message *log4c_async_message_create(
     return entry;
 }
 
+static void log4c_async_report_error(
+    log4c_async_logger *wrapper,
+    log4c_async_error error,
+    const char *detail
+) {
+    log4c_async_error_fn callback = NULL;
+    void *userdata = NULL;
+
+    if (wrapper == NULL) {
+        return;
+    }
+
+    callback = wrapper->error_callback;
+    userdata = wrapper->error_userdata;
+    if (callback != NULL) {
+        callback(userdata, error, detail);
+    }
+}
+
 static void *log4c_async_worker_main(void *userdata) {
     log4c_async_logger *wrapper = (log4c_async_logger *)userdata;
 
@@ -1439,6 +1458,12 @@ static void *log4c_async_worker_main(void *userdata) {
             ) < 0) {
             (void)pthread_mutex_lock(&wrapper->mutex);
             wrapper->worker_failed = true;
+            wrapper->stats.write_failures += 1U;
+            (void)pthread_mutex_unlock(&wrapper->mutex);
+            log4c_async_report_error(wrapper, LOG4C_ASYNC_ERROR_SINK_WRITE, entry->message);
+        } else {
+            (void)pthread_mutex_lock(&wrapper->mutex);
+            wrapper->stats.written += 1U;
             (void)pthread_mutex_unlock(&wrapper->mutex);
         }
 
@@ -1542,6 +1567,8 @@ bool log4c_async_logger_init(log4c_async_logger *wrapper, FILE *stream, size_t m
 
     log4c_logger_init(&wrapper->logger, stream);
     wrapper->max_queue = max_queue;
+    wrapper->queue_policy = LOG4C_ASYNC_QUEUE_BLOCK;
+    wrapper->stats.max_queue = max_queue;
 
     if (pthread_create(&wrapper->thread, NULL, log4c_async_worker_main, wrapper) != 0) {
         log4c_logger_destroy(&wrapper->logger);
@@ -1575,6 +1602,50 @@ bool log4c_async_logger_init_from_config(
         return false;
     }
 
+    return true;
+}
+
+void log4c_async_logger_set_queue_policy(
+    log4c_async_logger *wrapper,
+    log4c_async_queue_policy policy
+) {
+    if (wrapper == NULL) {
+        return;
+    }
+
+    (void)pthread_mutex_lock(&wrapper->mutex);
+    wrapper->queue_policy = policy;
+    (void)pthread_mutex_unlock(&wrapper->mutex);
+}
+
+void log4c_async_logger_set_error_callback(
+    log4c_async_logger *wrapper,
+    log4c_async_error_fn callback,
+    void *userdata
+) {
+    if (wrapper == NULL) {
+        return;
+    }
+
+    (void)pthread_mutex_lock(&wrapper->mutex);
+    wrapper->error_callback = callback;
+    wrapper->error_userdata = userdata;
+    (void)pthread_mutex_unlock(&wrapper->mutex);
+}
+
+bool log4c_async_logger_get_stats(
+    log4c_async_logger *wrapper,
+    log4c_async_stats *stats
+) {
+    if (wrapper == NULL || stats == NULL) {
+        return false;
+    }
+
+    (void)pthread_mutex_lock(&wrapper->mutex);
+    *stats = wrapper->stats;
+    stats->current_queue = wrapper->queued;
+    stats->max_queue = wrapper->max_queue;
+    (void)pthread_mutex_unlock(&wrapper->mutex);
     return true;
 }
 
@@ -1662,6 +1733,10 @@ int log4c_async_logger_vlog(
 
     message = (char *)malloc((size_t)message_size + 1U);
     if (message == NULL) {
+        (void)pthread_mutex_lock(&wrapper->mutex);
+        wrapper->stats.alloc_failures += 1U;
+        (void)pthread_mutex_unlock(&wrapper->mutex);
+        log4c_async_report_error(wrapper, LOG4C_ASYNC_ERROR_ALLOC, fmt);
         return -1;
     }
 
@@ -1673,11 +1748,42 @@ int log4c_async_logger_vlog(
     entry = log4c_async_message_create(level, tag, file, line, func, message);
     free(message);
     if (entry == NULL) {
+        (void)pthread_mutex_lock(&wrapper->mutex);
+        wrapper->stats.alloc_failures += 1U;
+        (void)pthread_mutex_unlock(&wrapper->mutex);
+        log4c_async_report_error(wrapper, LOG4C_ASYNC_ERROR_ALLOC, fmt);
         return -1;
     }
 
     (void)pthread_mutex_lock(&wrapper->mutex);
     while (!wrapper->stop && wrapper->queued >= wrapper->max_queue) {
+        log4c_async_message *dropped = NULL;
+
+        if (wrapper->queue_policy == LOG4C_ASYNC_QUEUE_DROP_NEWEST) {
+            wrapper->stats.queue_full += 1U;
+            wrapper->stats.dropped += 1U;
+            (void)pthread_mutex_unlock(&wrapper->mutex);
+            log4c_async_report_error(wrapper, LOG4C_ASYNC_ERROR_QUEUE_FULL, entry->message);
+            log4c_async_message_free(entry);
+            return 0;
+        }
+
+        if (wrapper->queue_policy == LOG4C_ASYNC_QUEUE_DROP_OLDEST) {
+            wrapper->stats.queue_full += 1U;
+            dropped = wrapper->head;
+            wrapper->head = dropped->next;
+            if (wrapper->head == NULL) {
+                wrapper->tail = NULL;
+            }
+            wrapper->queued -= 1U;
+            wrapper->stats.dropped += 1U;
+            (void)pthread_mutex_unlock(&wrapper->mutex);
+            log4c_async_report_error(wrapper, LOG4C_ASYNC_ERROR_QUEUE_FULL, dropped->message);
+            log4c_async_message_free(dropped);
+            (void)pthread_mutex_lock(&wrapper->mutex);
+            continue;
+        }
+
         (void)pthread_cond_wait(&wrapper->not_full, &wrapper->mutex);
     }
 
@@ -1694,6 +1800,7 @@ int log4c_async_logger_vlog(
     }
     wrapper->tail = entry;
     wrapper->queued += 1U;
+    wrapper->stats.enqueued += 1U;
     (void)pthread_cond_signal(&wrapper->not_empty);
     (void)pthread_mutex_unlock(&wrapper->mutex);
     return message_size;

@@ -566,6 +566,149 @@ typedef struct async_thread_ctx {
     int index;
 } async_thread_ctx;
 
+typedef struct async_error_state {
+    pthread_mutex_t mutex;
+    int count;
+    log4c_async_error last_error;
+    char last_detail[256];
+} async_error_state;
+
+typedef struct blocking_sink {
+    pthread_mutex_t mutex;
+    pthread_cond_t entered;
+    pthread_cond_t released;
+    memory_sink sink;
+    bool should_block;
+    bool is_blocking;
+    bool release_requested;
+} blocking_sink;
+
+static void async_error_record(
+    void *userdata,
+    log4c_async_error error,
+    const char *detail
+) {
+    async_error_state *state = (async_error_state *)userdata;
+
+    if (state == NULL) {
+        return;
+    }
+
+    (void)pthread_mutex_lock(&state->mutex);
+    state->count += 1;
+    state->last_error = error;
+    if (detail == NULL) {
+        state->last_detail[0] = '\0';
+    } else {
+        (void)snprintf(state->last_detail, sizeof(state->last_detail), "%s", detail);
+    }
+    (void)pthread_mutex_unlock(&state->mutex);
+}
+
+static int async_error_state_init(async_error_state *state) {
+    if (state == NULL) {
+        return 1;
+    }
+
+    memset(state, 0, sizeof(*state));
+    return pthread_mutex_init(&state->mutex, NULL) == 0 ? 0 : 1;
+}
+
+static void async_error_state_destroy(async_error_state *state) {
+    if (state == NULL) {
+        return;
+    }
+
+    (void)pthread_mutex_destroy(&state->mutex);
+}
+
+static int blocking_sink_init(blocking_sink *sink) {
+    if (sink == NULL) {
+        return 1;
+    }
+
+    memset(sink, 0, sizeof(*sink));
+    if (pthread_mutex_init(&sink->mutex, NULL) != 0) {
+        return 1;
+    }
+
+    if (pthread_cond_init(&sink->entered, NULL) != 0) {
+        (void)pthread_mutex_destroy(&sink->mutex);
+        return 1;
+    }
+
+    if (pthread_cond_init(&sink->released, NULL) != 0) {
+        (void)pthread_cond_destroy(&sink->entered);
+        (void)pthread_mutex_destroy(&sink->mutex);
+        return 1;
+    }
+
+    sink->should_block = true;
+    return 0;
+}
+
+static void blocking_sink_destroy(blocking_sink *sink) {
+    if (sink == NULL) {
+        return;
+    }
+
+    (void)pthread_cond_destroy(&sink->released);
+    (void)pthread_cond_destroy(&sink->entered);
+    (void)pthread_mutex_destroy(&sink->mutex);
+}
+
+static int blocking_sink_write(void *userdata, const char *record) {
+    blocking_sink *sink = (blocking_sink *)userdata;
+
+    if (sink == NULL) {
+        return -1;
+    }
+
+    (void)pthread_mutex_lock(&sink->mutex);
+    if (sink->should_block) {
+        sink->should_block = false;
+        sink->is_blocking = true;
+        (void)pthread_cond_signal(&sink->entered);
+        while (!sink->release_requested) {
+            (void)pthread_cond_wait(&sink->released, &sink->mutex);
+        }
+        sink->is_blocking = false;
+    }
+    (void)pthread_mutex_unlock(&sink->mutex);
+
+    return memory_sink_write(&sink->sink, record);
+}
+
+static int blocking_sink_wait_until_blocked(blocking_sink *sink) {
+    if (sink == NULL) {
+        return 1;
+    }
+
+    (void)pthread_mutex_lock(&sink->mutex);
+    while (!sink->is_blocking) {
+        (void)pthread_cond_wait(&sink->entered, &sink->mutex);
+    }
+    (void)pthread_mutex_unlock(&sink->mutex);
+    return 0;
+}
+
+static void blocking_sink_release(blocking_sink *sink) {
+    if (sink == NULL) {
+        return;
+    }
+
+    (void)pthread_mutex_lock(&sink->mutex);
+    sink->release_requested = true;
+    (void)pthread_cond_broadcast(&sink->released);
+    (void)pthread_mutex_unlock(&sink->mutex);
+}
+
+static int failing_sink_write(void *userdata, const char *record) {
+    (void)userdata;
+    (void)record;
+    return -1;
+}
+
 static void *thread_writer(void *userdata) {
     thread_ctx *ctx = (thread_ctx *)userdata;
     int iteration = 0;
@@ -749,6 +892,332 @@ static int test_async_logger_destroy_drains_queue(void) {
     remove_path_chain(path);
     return contains_text(buffer, "queued 0") && contains_text(buffer, "queued 19") ? 0 : 1;
 }
+
+static int test_async_logger_init_rejects_zero_queue(void) {
+    log4c_async_logger wrapper;
+
+    return log4c_async_logger_init(&wrapper, stderr, 0U) ? 1 : 0;
+}
+
+static int test_async_logger_drop_newest_policy(void) {
+    FILE *stream = tmpfile();
+    log4c_async_logger wrapper;
+    blocking_sink sink;
+    async_error_state errors;
+    log4c_async_stats stats;
+    int rc = 1;
+
+    if (stream == NULL) {
+        return 1;
+    }
+
+    if (blocking_sink_init(&sink) != 0) {
+        fclose(stream);
+        return 1;
+    }
+
+    if (async_error_state_init(&errors) != 0) {
+        blocking_sink_destroy(&sink);
+        fclose(stream);
+        return 1;
+    }
+
+    if (!log4c_async_logger_init(&wrapper, stream, 1U)) {
+        goto cleanup;
+    }
+
+    log4c_logger_clear_sinks(&wrapper.logger);
+    if (!log4c_logger_add_callback_sink(&wrapper.logger, blocking_sink_write, NULL, &sink, 0U)) {
+        log4c_async_logger_destroy(&wrapper);
+        goto cleanup;
+    }
+
+    log4c_async_logger_set_queue_policy(&wrapper, LOG4C_ASYNC_QUEUE_DROP_NEWEST);
+    log4c_async_logger_set_error_callback(&wrapper, async_error_record, &errors);
+
+    if (LOG4C_ASYNC_INFO(&wrapper, "async", "first") <= 0) {
+        log4c_async_logger_destroy(&wrapper);
+        goto cleanup;
+    }
+
+    if (blocking_sink_wait_until_blocked(&sink) != 0) {
+        log4c_async_logger_destroy(&wrapper);
+        goto cleanup;
+    }
+
+    if (LOG4C_ASYNC_INFO(&wrapper, "async", "second") <= 0) {
+        log4c_async_logger_destroy(&wrapper);
+        goto cleanup;
+    }
+
+    if (LOG4C_ASYNC_INFO(&wrapper, "async", "third") != 0) {
+        log4c_async_logger_destroy(&wrapper);
+        goto cleanup;
+    }
+
+    blocking_sink_release(&sink);
+    if (!log4c_async_logger_flush(&wrapper)) {
+        log4c_async_logger_destroy(&wrapper);
+        goto cleanup;
+    }
+
+    if (!log4c_async_logger_get_stats(&wrapper, &stats)) {
+        log4c_async_logger_destroy(&wrapper);
+        goto cleanup;
+    }
+
+    rc = contains_text(sink.sink.buffer, "first") &&
+        contains_text(sink.sink.buffer, "second") &&
+        !contains_text(sink.sink.buffer, "third") &&
+        stats.enqueued == 2U &&
+        stats.written == 2U &&
+        stats.dropped == 1U &&
+        stats.queue_full == 1U &&
+        stats.current_queue == 0U &&
+        errors.count == 1 &&
+        errors.last_error == LOG4C_ASYNC_ERROR_QUEUE_FULL &&
+        contains_text(errors.last_detail, "third") ? 0 : 1;
+
+    log4c_async_logger_destroy(&wrapper);
+
+cleanup:
+    async_error_state_destroy(&errors);
+    blocking_sink_destroy(&sink);
+    fclose(stream);
+    return rc;
+}
+
+static int test_async_logger_drop_oldest_policy(void) {
+    FILE *stream = tmpfile();
+    log4c_async_logger wrapper;
+    blocking_sink sink;
+    async_error_state errors;
+    log4c_async_stats stats;
+    int rc = 1;
+
+    if (stream == NULL) {
+        return 1;
+    }
+
+    if (blocking_sink_init(&sink) != 0) {
+        fclose(stream);
+        return 1;
+    }
+
+    if (async_error_state_init(&errors) != 0) {
+        blocking_sink_destroy(&sink);
+        fclose(stream);
+        return 1;
+    }
+
+    if (!log4c_async_logger_init(&wrapper, stream, 1U)) {
+        goto cleanup;
+    }
+
+    log4c_logger_clear_sinks(&wrapper.logger);
+    if (!log4c_logger_add_callback_sink(&wrapper.logger, blocking_sink_write, NULL, &sink, 0U)) {
+        log4c_async_logger_destroy(&wrapper);
+        goto cleanup;
+    }
+
+    log4c_async_logger_set_queue_policy(&wrapper, LOG4C_ASYNC_QUEUE_DROP_OLDEST);
+    log4c_async_logger_set_error_callback(&wrapper, async_error_record, &errors);
+
+    if (LOG4C_ASYNC_INFO(&wrapper, "async", "first") <= 0) {
+        log4c_async_logger_destroy(&wrapper);
+        goto cleanup;
+    }
+
+    if (blocking_sink_wait_until_blocked(&sink) != 0) {
+        log4c_async_logger_destroy(&wrapper);
+        goto cleanup;
+    }
+
+    if (LOG4C_ASYNC_INFO(&wrapper, "async", "second") <= 0) {
+        log4c_async_logger_destroy(&wrapper);
+        goto cleanup;
+    }
+
+    if (LOG4C_ASYNC_INFO(&wrapper, "async", "third") <= 0) {
+        log4c_async_logger_destroy(&wrapper);
+        goto cleanup;
+    }
+
+    blocking_sink_release(&sink);
+    if (!log4c_async_logger_flush(&wrapper)) {
+        log4c_async_logger_destroy(&wrapper);
+        goto cleanup;
+    }
+
+    if (!log4c_async_logger_get_stats(&wrapper, &stats)) {
+        log4c_async_logger_destroy(&wrapper);
+        goto cleanup;
+    }
+
+    rc = contains_text(sink.sink.buffer, "first") &&
+        !contains_text(sink.sink.buffer, "second") &&
+        contains_text(sink.sink.buffer, "third") &&
+        stats.enqueued == 3U &&
+        stats.written == 2U &&
+        stats.dropped == 1U &&
+        stats.queue_full == 1U &&
+        stats.current_queue == 0U &&
+        errors.count == 1 &&
+        errors.last_error == LOG4C_ASYNC_ERROR_QUEUE_FULL &&
+        contains_text(errors.last_detail, "second") ? 0 : 1;
+
+    log4c_async_logger_destroy(&wrapper);
+
+cleanup:
+    async_error_state_destroy(&errors);
+    blocking_sink_destroy(&sink);
+    fclose(stream);
+    return rc;
+}
+
+static int test_async_logger_reports_sink_write_failures(void) {
+    FILE *stream = tmpfile();
+    log4c_async_logger wrapper;
+    async_error_state errors;
+    log4c_async_stats stats;
+    int rc = 1;
+
+    if (stream == NULL) {
+        return 1;
+    }
+
+    if (async_error_state_init(&errors) != 0) {
+        fclose(stream);
+        return 1;
+    }
+
+    if (!log4c_async_logger_init(&wrapper, stream, 4U)) {
+        async_error_state_destroy(&errors);
+        fclose(stream);
+        return 1;
+    }
+
+    log4c_logger_clear_sinks(&wrapper.logger);
+    if (!log4c_logger_add_callback_sink(&wrapper.logger, failing_sink_write, NULL, NULL, 0U)) {
+        log4c_async_logger_destroy(&wrapper);
+        async_error_state_destroy(&errors);
+        fclose(stream);
+        return 1;
+    }
+
+    log4c_async_logger_set_error_callback(&wrapper, async_error_record, &errors);
+    if (LOG4C_ASYNC_ERROR(&wrapper, "async", "write failed") <= 0) {
+        log4c_async_logger_destroy(&wrapper);
+        async_error_state_destroy(&errors);
+        fclose(stream);
+        return 1;
+    }
+
+    if (log4c_async_logger_flush(&wrapper)) {
+        log4c_async_logger_destroy(&wrapper);
+        async_error_state_destroy(&errors);
+        fclose(stream);
+        return 1;
+    }
+
+    if (!log4c_async_logger_get_stats(&wrapper, &stats)) {
+        log4c_async_logger_destroy(&wrapper);
+        async_error_state_destroy(&errors);
+        fclose(stream);
+        return 1;
+    }
+
+    rc = stats.enqueued == 1U &&
+        stats.written == 0U &&
+        stats.write_failures == 1U &&
+        errors.count == 1 &&
+        errors.last_error == LOG4C_ASYNC_ERROR_SINK_WRITE &&
+        contains_text(errors.last_detail, "write failed") ? 0 : 1;
+
+    log4c_async_logger_destroy(&wrapper);
+    async_error_state_destroy(&errors);
+    fclose(stream);
+    return rc;
+}
+
+static int test_async_logger_stress_and_stats(void) {
+    FILE *stream = tmpfile();
+    log4c_async_logger wrapper;
+    pthread_t threads[8];
+    async_thread_ctx ctx[8];
+    log4c_async_stats stats;
+    char line[256];
+    int index = 0;
+    int line_count = 0;
+
+    if (stream == NULL) {
+        return 1;
+    }
+
+    if (!log4c_async_logger_init(&wrapper, stream, 64U)) {
+        fclose(stream);
+        return 1;
+    }
+
+    log4c_logger_set_level(&wrapper.logger, LOG4C_LEVEL_TRACE);
+    log4c_logger_set_options(&wrapper.logger, LOG4C_OPTION_AUTO_FLUSH);
+
+    for (index = 0; index < 8; ++index) {
+        ctx[index].wrapper = &wrapper;
+        ctx[index].index = index;
+        if (pthread_create(&threads[index], NULL, async_thread_writer, &ctx[index]) != 0) {
+            log4c_async_logger_destroy(&wrapper);
+            fclose(stream);
+            return 1;
+        }
+    }
+
+    for (index = 0; index < 8; ++index) {
+        if (pthread_join(threads[index], NULL) != 0) {
+            log4c_async_logger_destroy(&wrapper);
+            fclose(stream);
+            return 1;
+        }
+    }
+
+    for (index = 0; index < 8; ++index) {
+        int extra = 0;
+
+        for (extra = 50; extra < 500; ++extra) {
+            if (LOG4C_ASYNC_INFO(&wrapper, "async", "worker %d round %d", index, extra) <= 0) {
+                log4c_async_logger_destroy(&wrapper);
+                fclose(stream);
+                return 1;
+            }
+        }
+    }
+
+    if (!log4c_async_logger_flush(&wrapper)) {
+        log4c_async_logger_destroy(&wrapper);
+        fclose(stream);
+        return 1;
+    }
+
+    if (!log4c_async_logger_get_stats(&wrapper, &stats)) {
+        log4c_async_logger_destroy(&wrapper);
+        fclose(stream);
+        return 1;
+    }
+
+    rewind(stream);
+    while (fgets(line, (int)sizeof(line), stream) != NULL) {
+        line_count += 1;
+    }
+
+    log4c_async_logger_destroy(&wrapper);
+    fclose(stream);
+    return line_count == 4000 &&
+        stats.enqueued == 4000U &&
+        stats.written == 4000U &&
+        stats.dropped == 0U &&
+        stats.write_failures == 0U &&
+        stats.current_queue == 0U ? 0 : 1;
+}
 #endif
 
 int main(void) {
@@ -793,11 +1262,31 @@ int main(void) {
         return EXIT_FAILURE;
     }
 
+    if (test_async_logger_init_rejects_zero_queue() != 0) {
+        return EXIT_FAILURE;
+    }
+
     if (test_async_logger_wrapper() != 0) {
         return EXIT_FAILURE;
     }
 
     if (test_async_logger_destroy_drains_queue() != 0) {
+        return EXIT_FAILURE;
+    }
+
+    if (test_async_logger_drop_newest_policy() != 0) {
+        return EXIT_FAILURE;
+    }
+
+    if (test_async_logger_drop_oldest_policy() != 0) {
+        return EXIT_FAILURE;
+    }
+
+    if (test_async_logger_reports_sink_write_failures() != 0) {
+        return EXIT_FAILURE;
+    }
+
+    if (test_async_logger_stress_and_stats() != 0) {
         return EXIT_FAILURE;
     }
 #endif
